@@ -16,7 +16,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@microsoft/signalr": "^8.0.29",
+    "@microsoft/signalr": "^11.0.0",
     "esbuild": "^0.25.0"
   }
 }
