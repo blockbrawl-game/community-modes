@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Bloom Blocks</title>
+<style>
+  :root { --text: #fdf6f0; --dim: #d9c7d6; --card: rgba(255, 255, 255, 0.08); }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { color: var(--text); font: 14px/1.4 "Trebuchet MS", system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; gap: 10px;
+         padding: 12px; user-select: none; touch-action: none; overflow: hidden;
+         background: linear-gradient(160deg, #2b1a4a, #4a2350 40%, #7a3b54 75%, #b9645a); background-size: 300% 300%; animation: sky 24s ease-in-out infinite; }
+  @keyframes sky { 0%, 100% { background-position: 0% 0%; } 50% { background-position: 100% 100%; } }
+  .bar { display: flex; gap: 8px; width: min(100%, 420px); }
+  .player { flex: 1; background: var(--card); border-radius: 12px; padding: 6px 10px; border: 2px solid transparent; transition: border-color .25s, transform .25s; backdrop-filter: blur(6px); }
+  .player.turn { border-color: #ffd98a; transform: translateY(-2px); box-shadow: 0 6px 24px rgba(255, 200, 120, .25); }
+  .player span { font-size: 12px; color: var(--dim); }
+  .player b { display: block; font-size: 24px; font-variant-numeric: tabular-nums; }
+  .clock { height: 4px; border-radius: 2px; background: rgba(255,255,255,.15); margin-top: 4px; overflow: hidden; }
+  .clock i { display: block; height: 100%; background: #ffd98a; width: 100%; }
+  #view { width: min(100%, 420px); aspect-ratio: 900 / 1260; }
+  #status { min-height: 20px; color: var(--dim); letter-spacing: .5px; }
+  #perf { position: fixed; right: 8px; bottom: 6px; color: rgba(255,255,255,.45); font: 11px ui-monospace, monospace; }
+  .result { position: fixed; inset: 0; background: rgba(30, 14, 40, 0.82); display: none; place-items: center; text-align: center; backdrop-filter: blur(4px); }
+  .result.show { display: grid; animation: fade .4s ease-out; }
+  @keyframes fade { from { opacity: 0; } }
+  .result h1 { margin: 0 0 8px; font-size: 36px; }
+</style>
+</head>
+<body>
+  <div class="bar" id="bar"></div>
+  <canvas id="view" width="900" height="1260"></canvas>
+  <div id="status"></div>
+  <div id="perf"></div>
+  <div class="result" id="result"><div><h1 id="resultTitle"></h1><div id="resultText"></div></div></div>
+
+<script type="module">
+import { connect } from '@blockbrawl/mode-sdk/client';
+import { createModel } from './model.js';
+import { HAND, SHAPES, SIZE, TURN_MS, fits, linesIfPlaced } from '../shared.js';
+
+// Visual-only randomness (sparks, petals, shake). The mode checks forbid the built-in generator everywhere so that
+// game logic can never depend on it, and the effects do not need a real one.
+let fxSeed = (performance.now() * 1000) >>> 0 || 1;
+function fxRandom() {
+  fxSeed ^= fxSeed << 13; fxSeed ^= fxSeed >>> 17; fxSeed ^= fxSeed << 5;
+  return (fxSeed >>> 0) / 4294967296;
+}
+
+// Flower palette: [light, dark] per colour index 1-7.
+const PETALS = [null, ['#ffd1e8', '#e2568f'], ['#ffe9a8', '#e8a12c'], ['#c9f2ff', '#3c9fd6'], ['#d9ffc9', '#4fae5a'],
+  ['#e7d4ff', '#8a5ad8'], ['#ffd7c2', '#e4683c'], ['#fff6c4', '#d8b62a']];
+
+const model = createModel();
+const s = model.state;
+const $ = (id) => document.getElementById(id);
+const canvas = $('view');
+const g = canvas.getContext('2d');
+const BOARD = 900, CELL = BOARD / SIZE, TRAY_Y = BOARD + 40, TRAY_H = 300;
+
+const born = new Array(SIZE * SIZE).fill(-1e9); // when each cell was planted, for the pop-in
+const particles = [];
+const floaters = [];
+let seenEvents = 0;
+let shake = 0;
+let drag = null; // { k, shapeId, px, py }
+
+const game = connect({
+  model,
+  onResult(result) {
+    const solo = s.order.length === 1;
+    const first = result.ranking[0];
+    const winners = Array.isArray(first) ? first : [first];
+    $('resultTitle').textContent = solo ? `${s.players[0].score} points` : winners.length > 1 ? 'A tie!' : winners.includes(game.me) ? 'Your garden wins' : 'Their garden wins';
+    $('resultText').textContent = s.why === 'garden_full' ? 'No room left to plant.' : s.why === 'season_over' ? 'The season is over.' : '';
+    $('result').classList.add('show');
+  },
+});
+
+const myTurn = () => game.ready && !s.over && s.turn === s.me;
+function name(p) {
+  if (p === s.me) return 'You';
+  return game.players.find((pl) => pl.id === s.order[p])?.name ?? `Player ${p + 1}`;
+}
+
+// ---- input ---------------------------------------------------------------------------------------------
+
+function toCanvas(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: ((e.clientX - r.left) / r.width) * canvas.width, y: ((e.clientY - r.top) / r.height) * canvas.height };
+}
+function slotAt(x, y) {
+  if (y < TRAY_Y || y > TRAY_Y + TRAY_H) return -1;
+  return Math.floor(x / (BOARD / HAND));
+}
+// Where the dragged shape would land: its cells are drawn above the finger so it stays visible.
+function dropCell(shapeId, px, py) {
+  const cells = SHAPES[shapeId].c;
+  const w = Math.max(...cells.map((c) => c[0])) + 1, h = Math.max(...cells.map((c) => c[1])) + 1;
+  return { x: Math.round(px / CELL - w / 2), y: Math.round((py - CELL * 1.6) / CELL - h / 2) };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (!myTurn() || model.pending()) return;
+  const p = toCanvas(e);
+  const k = slotAt(p.x, p.y);
+  const shapeId = s.hands[s.me]?.[k];
+  if (k < 0 || shapeId === undefined || shapeId < 0) return;
+  drag = { k, shapeId, px: p.x, py: p.y };
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const p = toCanvas(e);
+  drag.px = p.x;
+  drag.py = p.y;
+});
+canvas.addEventListener('pointerup', () => {
+  if (!drag) return;
+  const { x, y } = dropCell(drag.shapeId, drag.px, drag.py);
+  if (myTurn() && fits(s.board, drag.shapeId, x, y)) model.predict(game.send({ t: 'place', k: drag.k, x, y }), drag.k, x, y);
+  drag = null;
+});
+
+// ---- drawing helpers -----------------------------------------------------------------------------------
+
+function rr(x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+
+function block(x, y, size, k, alpha = 1, scale = 1) {
+  const [light, dark] = PETALS[k];
+  const inset = (size * (1 - scale)) / 2 + size * 0.05;
+  const bx = x + inset, by = y + inset, bs = size - inset * 2;
+  g.globalAlpha = alpha;
+  const grad = g.createLinearGradient(bx, by, bx + bs, by + bs);
+  grad.addColorStop(0, light); grad.addColorStop(1, dark);
+  g.shadowColor = dark; g.shadowBlur = 12 * scale;
+  rr(bx, by, bs, bs, bs * 0.26); g.fillStyle = grad; g.fill();
+  g.shadowBlur = 0;
+  // Petal highlight and a small centre: reads as a flower, costs four calls.
+  g.fillStyle = 'rgba(255,255,255,0.45)';
+  g.beginPath(); g.ellipse(bx + bs * 0.34, by + bs * 0.3, bs * 0.2, bs * 0.11, -0.6, 0, Math.PI * 2); g.fill();
+  g.fillStyle = 'rgba(255, 244, 200, 0.85)';
+  g.beginPath(); g.arc(bx + bs * 0.5, by + bs * 0.55, bs * 0.09, 0, Math.PI * 2); g.fill();
+  g.globalAlpha = 1;
+}
+
+function shapeAt(shapeId, ox, oy, size, alpha, scale = 1) {
+  for (const [dx, dy] of SHAPES[shapeId].c) block(ox + dx * size, oy + dy * size, size, SHAPES[shapeId].k, alpha, scale);
+}
+
+function bloom(i, k, delay) {
+  const cx = ((i % SIZE) + 0.5) * CELL, cy = (Math.floor(i / SIZE) + 0.5) * CELL;
+  for (let n = 0; n < 7; n++) {
+    const a = fxRandom() * Math.PI * 2, v = 2 + fxRandom() * 6;
+    particles.push({ x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 2, rot: fxRandom() * 6, vr: (fxRandom() - 0.5) * 0.3,
+      life: 1, delay, k, size: 10 + fxRandom() * 12 });
+  }
+}
+
+// ---- reacting to the model's events -------------------------------------------------------------------
+
+function consumeEvents(now) {
+  const evs = model.fx.events;
+  const fresh = Math.min(evs.length, model.fx.count - seenEvents);
+  for (let n = evs.length - fresh; n < evs.length; n++) {
+    const e = evs[n];
+    if (e.kind === 'place') {
+      for (const [dx, dy] of SHAPES[e.shapeId].c) born[(e.y + dy) * SIZE + e.x + dx] = now;
+      e.cleared.forEach((c, n2) => { bloom(c.i, c.k || SHAPES[e.shapeId].k, (n2 % SIZE) * 25); born[c.i] = -1e9; });
+      if (e.lines > 0) {
+        shake = Math.min(26, 8 * e.lines);
+        floaters.push({ text: `+${e.gained}`, sub: e.lines > 1 ? `${e.lines} lines!` : e.streak > 1 ? `streak x${e.streak}` : 'bloom!',
+          x: (e.x + 1) * CELL, y: (e.y + 0.5) * CELL, at: now });
+      }
+    } else if (e.kind === 'timeout' && e.p === s.me) {
+      floaters.push({ text: 'Too slow', sub: 'turn skipped', x: BOARD / 2, y: BOARD / 2, at: now });
+    }
+  }
+  seenEvents = model.fx.count;
+}
+
+// ---- frame ---------------------------------------------------------------------------------------------
+
+function drawBoard(now) {
+  // Soil and grid.
+  rr(6, 6, BOARD - 12, BOARD - 12, 34);
+  g.fillStyle = 'rgba(30, 12, 36, 0.55)'; g.fill();
+  for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+    const shade = ((Math.floor(x / 3) + Math.floor(y / 3)) % 2) ? 0.06 : 0.1;
+    rr(x * CELL + 6, y * CELL + 6, CELL - 12, CELL - 12, 16);
+    g.fillStyle = `rgba(255, 255, 255, ${shade})`; g.fill();
+  }
+
+  // Ghost of the dragged shape, and the lines it would clear.
+  if (drag) {
+    const { x, y } = dropCell(drag.shapeId, drag.px, drag.py);
+    if (fits(s.board, drag.shapeId, x, y)) {
+      const { rows, cols } = linesIfPlaced(s.board, drag.shapeId, x, y);
+      const pulse = 0.25 + 0.15 * Math.sin(now / 120);
+      g.fillStyle = `rgba(255, 230, 150, ${pulse})`;
+      for (const r of rows) { rr(4, r * CELL + 4, BOARD - 8, CELL - 8, 18); g.fill(); }
+      for (const c of cols) { rr(c * CELL + 4, 4, CELL - 8, BOARD - 8, 18); g.fill(); }
+      shapeAt(drag.shapeId, x * CELL, y * CELL, CELL, 0.35);
+    }
+  }
+
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    const k = s.board[i];
+    if (!k) continue;
+    const t = Math.min(1, (now - born[i]) / 260);
+    const scale = t >= 1 ? 1 : 1 + 0.18 * Math.sin(t * Math.PI) - 0.25 * (1 - t); // overshoot pop-in
+    block((i % SIZE) * CELL, Math.floor(i / SIZE) * CELL, CELL, k, 1, scale);
+  }
+
+  const pend = model.pending();
+  if (pend) {
+    const shapeId = s.hands[s.me]?.[pend.k];
+    if (shapeId >= 0) shapeAt(shapeId, pend.x * CELL, pend.y * CELL, CELL, 0.75);
+  }
+}
+
+function drawTray(now) {
+  const slotW = BOARD / HAND;
+  rr(6, TRAY_Y, BOARD - 12, TRAY_H, 30);
+  g.fillStyle = 'rgba(255, 255, 255, 0.07)'; g.fill();
+  const hand = s.hands[s.me] ?? [];
+  const active = myTurn();
+  hand.forEach((shapeId, k) => {
+    if (shapeId < 0 || (drag && drag.k === k) || (model.pending() && model.pending().k === k)) return;
+    const cells = SHAPES[shapeId].c;
+    const w = Math.max(...cells.map((c) => c[0])) + 1, h = Math.max(...cells.map((c) => c[1])) + 1;
+    const size = Math.min(56, (slotW - 40) / w, (TRAY_H - 60) / h);
+    const bob = active ? Math.sin(now / 400 + k) * 4 : 0;
+    const playable = active && hasRoom(shapeId);
+    shapeAt(shapeId, k * slotW + (slotW - w * size) / 2, TRAY_Y + (TRAY_H - h * size) / 2 + bob, size, playable ? 1 : 0.35);
+  });
+  if (drag) {
+    const { x, y } = dropCell(drag.shapeId, drag.px, drag.py);
+    shapeAt(drag.shapeId, x * CELL + (drag.px - (x + 0.5) * CELL) * 0.15, y * CELL, CELL, 0.95, 0.92);
+  }
+}
+
+const roomCache = new Map();
+let roomKey = '';
+function hasRoom(shapeId) {
+  const key = s.board.join('');
+  if (key !== roomKey) { roomCache.clear(); roomKey = key; }
+  if (!roomCache.has(shapeId)) {
+    let ok = false;
+    for (let y = 0; y < SIZE && !ok; y++) for (let x = 0; x < SIZE && !ok; x++) ok = fits(s.board, shapeId, x, y);
+    roomCache.set(shapeId, ok);
+  }
+  return roomCache.get(shapeId);
+}
+
+function drawEffects(now) {
+  for (let n = particles.length - 1; n >= 0; n--) {
+    const p = particles[n];
+    if (p.delay > 0) { p.delay -= 16; continue; }
+    p.x += p.vx; p.y += p.vy; p.vy += 0.18; p.vx *= 0.98; p.rot += p.vr; p.life -= 0.018;
+    if (p.life <= 0) { particles.splice(n, 1); continue; }
+    g.save(); g.translate(p.x, p.y); g.rotate(p.rot); g.globalAlpha = p.life;
+    g.fillStyle = PETALS[p.k][0];
+    g.beginPath(); g.ellipse(0, 0, p.size, p.size * 0.45, 0, 0, Math.PI * 2); g.fill();
+    g.restore();
+  }
+  for (let n = floaters.length - 1; n >= 0; n--) {
+    const f = floaters[n];
+    const t = (now - f.at) / 1100;
+    if (t > 1) { floaters.splice(n, 1); continue; }
+    const ease = 1 - Math.pow(1 - Math.min(1, t * 2), 3);
+    g.globalAlpha = 1 - Math.max(0, t - 0.6) / 0.4;
+    g.textAlign = 'center';
+    g.font = `bold ${60 + ease * 16}px "Trebuchet MS", sans-serif`;
+    g.fillStyle = '#fff6d8'; g.shadowColor = '#ff9ec7'; g.shadowBlur = 18;
+    g.fillText(f.text, f.x, f.y - ease * 70);
+    g.font = 'bold 34px "Trebuchet MS", sans-serif';
+    g.fillText(f.sub, f.x, f.y - ease * 70 + 44);
+    g.shadowBlur = 0; g.globalAlpha = 1;
+  }
+}
+
+const bar = [];
+function drawBar() {
+  s.players.forEach((pl, p) => {
+    if (!bar[p]) {
+      const el = document.createElement('div');
+      el.className = 'player';
+      el.innerHTML = '<span></span><b></b><div class="clock"><i></i></div>';
+      $('bar').appendChild(el);
+      bar[p] = el;
+    }
+    const el = bar[p];
+    el.classList.toggle('turn', s.turn === p && !s.over && s.players.length > 1);
+    el.querySelector('span').textContent = `${name(p)}${pl.streak > 1 ? `  🌸 x${pl.streak}` : ''}`;
+    el.querySelector('b').textContent = pl.score;
+    const clock = el.querySelector('.clock');
+    clock.style.visibility = s.players.length > 1 && s.turn === p && !s.over ? 'visible' : 'hidden';
+    clock.firstChild.style.width = `${Math.max(0, Math.min(1, (s.turnEndsAt - game.timeMs()) / TURN_MS)) * 100}%`;
+  });
+  $('status').textContent = s.over ? '' : s.players.length === 1 ? `Planted ${s.placements}` : myTurn() ? 'Your turn: drag a shape onto the garden' : `${name(s.turn)} is planting…`;
+}
+
+let frames = 0, lastPerf = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  frames++;
+  if (now - lastPerf >= 1000) { $('perf').textContent = `${Math.round((frames * 1000) / (now - lastPerf))} fps · ${particles.length} petals`; frames = 0; lastPerf = now; }
+  if (!game.ready) return;
+  consumeEvents(now);
+  g.save();
+  g.clearRect(0, 0, canvas.width, canvas.height);
+  if (shake > 0) { g.translate((fxRandom() - 0.5) * shake, (fxRandom() - 0.5) * shake); shake *= 0.86; if (shake < 0.5) shake = 0; }
+  drawBoard(now);
+  drawTray(now);
+  drawEffects(now);
+  g.restore();
+  drawBar();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

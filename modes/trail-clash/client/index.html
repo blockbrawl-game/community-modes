@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Trail Clash</title>
+<style>
+  :root { --bg: #05070d; --panel: #0a0e18; --text: #e9ecf5; --dim: #6f7890; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; display: flex; flex-direction: column; align-items: center;
+         gap: 10px; padding: 12px; user-select: none; touch-action: none; overflow: hidden; }
+  .top { display: flex; justify-content: space-between; width: min(100%, 440px); font-variant-numeric: tabular-nums; }
+  .top b { font-size: 22px; }
+  .top span { color: var(--dim); font-size: 12px; display: block; }
+  #arena { width: min(100%, 440px); aspect-ratio: 1; border-radius: 10px; background: var(--panel); }
+  .pad { display: grid; grid-template-columns: repeat(3, 56px); grid-template-rows: repeat(2, 44px); gap: 6px; }
+  .pad button { border-radius: 8px; border: 1px solid #1f2638; background: #0e1322; color: var(--text); font-size: 18px; }
+  .pad button:active { background: #1f2638; }
+  #up { grid-column: 2; } #left { grid-column: 1; grid-row: 2; } #down { grid-column: 2; grid-row: 2; } #right { grid-column: 3; grid-row: 2; }
+  .hint { color: var(--dim); font-size: 12px; }
+  #perf { position: fixed; right: 8px; bottom: 6px; color: var(--dim); font: 11px ui-monospace, monospace; }
+  .result { position: fixed; inset: 0; background: rgba(4, 6, 10, 0.88); display: none; place-items: center; text-align: center; }
+  .result.show { display: grid; }
+  .result h1 { margin: 0 0 8px; font-size: 32px; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <div><span>Length</span><b id="len">1</b></div>
+    <div style="text-align:center"><span>Alive</span><b id="alive">–</b></div>
+    <div style="text-align:right"><span id="timeLabel">Time</span><b id="time">90</b></div>
+  </div>
+  <canvas id="arena" width="880" height="880"></canvas>
+  <div class="pad">
+    <button id="up" aria-label="Up">▲</button><button id="left" aria-label="Left">◀</button>
+    <button id="down" aria-label="Down">▼</button><button id="right" aria-label="Right">▶</button>
+  </div>
+  <div class="hint">Arrow keys or WASD, or swipe on the arena</div>
+  <div id="perf"></div>
+  <div class="result" id="result"><div><h1 id="resultTitle"></h1><div id="resultText"></div></div></div>
+
+<script type="module">
+import { connect } from '@blockbrawl/mode-sdk/client';
+import { createModel } from './model.js';
+import { DIRS, SHRINK_AT_MS, SIZE, WALL, canTurn } from '../shared.js';
+
+// Visual-only randomness (sparks, petals, shake). The mode checks forbid the built-in generator everywhere so that
+// game logic can never depend on it, and the effects do not need a real one.
+let fxSeed = (performance.now() * 1000) >>> 0 || 1;
+function fxRandom() {
+  fxSeed ^= fxSeed << 13; fxSeed ^= fxSeed >>> 17; fxSeed ^= fxSeed << 5;
+  return (fxSeed >>> 0) / 4294967296;
+}
+
+const COLORS = ['#3ee0ff', '#ff4fd8', '#b6ff4f', '#ffb13e'];
+const model = createModel();
+const s = model.state;
+const $ = (id) => document.getElementById(id);
+const canvas = $('arena');
+const g = canvas.getContext('2d');
+const cs = canvas.width / SIZE;
+const sparks = [];
+let seenCrashes = 0;
+let shake = 0;
+
+const game = connect({
+  model,
+  onResult(result) {
+    const first = result.ranking[0];
+    const winners = Array.isArray(first) ? first : [first];
+    const solo = s.order.length === 1;
+    $('resultTitle').textContent = solo ? `Length ${s.players[0].len}` : winners.length > 1 ? 'Draw' : winners.includes(game.me) ? 'Last one standing!' : 'Crashed';
+    $('resultText').textContent = s.order.map((id, p) => `${name(p)}: ${s.players[p].len}`).join('   ');
+    $('result').classList.add('show');
+  },
+});
+
+function name(p) {
+  if (p === s.me) return 'You';
+  return game.players.find((pl) => pl.id === s.order[p])?.name ?? `Player ${p + 1}`;
+}
+
+function turn(d) {
+  const mine = s.players[s.me];
+  if (!game.ready || s.over || !mine || !mine.alive) return;
+  if (model.pendingCount() >= 2 || !canTurn(model.nextHeading(), d)) return;
+  model.predict(game.send({ t: 'turn', d }), d);
+}
+
+const KEYS = { ArrowUp: 0, KeyW: 0, ArrowRight: 1, KeyD: 1, ArrowDown: 2, KeyS: 2, ArrowLeft: 3, KeyA: 3 };
+addEventListener('keydown', (e) => {
+  if (!(e.code in KEYS) || e.repeat) return;
+  e.preventDefault();
+  turn(KEYS[e.code]);
+});
+[['up', 0], ['right', 1], ['down', 2], ['left', 3]].forEach(([id, d]) => $(id).addEventListener('pointerdown', () => turn(d)));
+
+let swipe = null;
+canvas.addEventListener('pointerdown', (e) => { swipe = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener('pointermove', (e) => {
+  if (!swipe) return;
+  const dx = e.clientX - swipe.x, dy = e.clientY - swipe.y;
+  if (Math.hypot(dx, dy) < 24) return;
+  turn(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 1 : 3) : (dy > 0 ? 2 : 0));
+  swipe = null;
+});
+addEventListener('pointerup', () => { swipe = null; });
+
+// ---- rendering ---------------------------------------------------------------------------------------
+
+// Trails are drawn to an offscreen layer cell by cell as they grow, so a frame costs the same at
+// move 10 and at move 1000.
+const layer = document.createElement('canvas');
+layer.width = layer.height = canvas.width;
+const lg = layer.getContext('2d');
+let drawnGrid = [];
+
+function refreshLayer() {
+  if (drawnGrid.length !== s.grid.length) {
+    drawnGrid = new Array(s.grid.length).fill(0);
+    lg.clearRect(0, 0, layer.width, layer.height);
+  }
+  for (let i = 0; i < s.grid.length; i++) {
+    const v = s.grid[i];
+    if (v === drawnGrid[i]) continue;
+    drawnGrid[i] = v;
+    const x = (i % SIZE) * cs, y = Math.floor(i / SIZE) * cs;
+    lg.clearRect(x, y, cs, cs);
+    if (v === WALL) {
+      lg.fillStyle = '#2a0f1c';
+      lg.fillRect(x, y, cs, cs);
+      lg.fillStyle = '#ff3e6c';
+      lg.fillRect(x + cs * 0.35, y + cs * 0.35, cs * 0.3, cs * 0.3);
+    } else if (v > 0) {
+      const color = COLORS[(v - 1) % COLORS.length];
+      lg.shadowColor = color;
+      lg.shadowBlur = 10;
+      lg.fillStyle = color;
+      lg.fillRect(x + 1.5, y + 1.5, cs - 3, cs - 3);
+      lg.shadowBlur = 0;
+    }
+  }
+}
+
+function drawGridLines() {
+  g.strokeStyle = 'rgba(80, 110, 170, 0.08)';
+  g.lineWidth = 1;
+  g.beginPath();
+  for (let i = 0; i <= SIZE; i++) {
+    g.moveTo(i * cs, 0); g.lineTo(i * cs, canvas.height);
+    g.moveTo(0, i * cs); g.lineTo(canvas.width, i * cs);
+  }
+  g.stroke();
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  perf(now);
+  if (!game.ready) return;
+
+  for (; seenCrashes < model.fx.crashCount; seenCrashes++) {
+    const c = model.fx.crashes[model.fx.crashes.length - (model.fx.crashCount - seenCrashes)];
+    if (!c) continue;
+    for (let n = 0; n < 50; n++) {
+      const a = fxRandom() * Math.PI * 2, v = 2 + fxRandom() * 9;
+      sparks.push({ x: (c.x + 0.5) * cs, y: (c.y + 0.5) * cs, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 1, color: COLORS[c.p % COLORS.length] });
+    }
+    if (c.p === s.me) shake = 22;
+  }
+
+  g.save();
+  if (shake > 0) { g.translate((fxRandom() - 0.5) * shake, (fxRandom() - 0.5) * shake); shake *= 0.86; if (shake < 0.5) shake = 0; }
+  g.fillStyle = '#0a0e18';
+  g.fillRect(-30, -30, canvas.width + 60, canvas.height + 60);
+  drawGridLines();
+  refreshLayer();
+  g.drawImage(layer, 0, 0);
+
+  // Heads: interpolated toward the next cell so motion looks smooth between 6-10 moves a second.
+  const moveMs = s.moveTicks * 50;
+  const t = Math.min(1, (now - model.fx.lastMoveAt) / moveMs);
+  s.players.forEach((pl, p) => {
+    if (!pl.alive) return;
+    const color = COLORS[p % COLORS.length];
+    const lead = s.over ? 0 : t;
+    const hx = (pl.x + 0.5 + DIRS[pl.dir][0] * lead * 0.6) * cs;
+    const hy = (pl.y + 0.5 + DIRS[pl.dir][1] * lead * 0.6) * cs;
+    g.shadowColor = color;
+    g.shadowBlur = 28;
+    g.fillStyle = '#fff';
+    g.beginPath(); g.arc(hx, hy, cs * 0.55, 0, Math.PI * 2); g.fill();
+    g.shadowBlur = 0;
+    if (p === s.me) {
+      // The arrow shows the heading after every turn sent, before the server has confirmed it.
+      const d = model.nextHeading();
+      g.fillStyle = color;
+      g.beginPath();
+      const ax = hx + DIRS[d][0] * cs * 1.4, ay = hy + DIRS[d][1] * cs * 1.4;
+      const px = -DIRS[d][1], py = DIRS[d][0];
+      g.moveTo(ax + DIRS[d][0] * cs * 0.6, ay + DIRS[d][1] * cs * 0.6);
+      g.lineTo(ax + px * cs * 0.5, ay + py * cs * 0.5);
+      g.lineTo(ax - px * cs * 0.5, ay - py * cs * 0.5);
+      g.fill();
+    }
+  });
+
+  for (let n = sparks.length - 1; n >= 0; n--) {
+    const p = sparks[n];
+    p.x += p.vx; p.y += p.vy; p.vx *= 0.93; p.vy *= 0.93; p.life -= 0.025;
+    if (p.life <= 0) { sparks.splice(n, 1); continue; }
+    g.globalAlpha = p.life; g.fillStyle = p.color; g.fillRect(p.x - 2.5, p.y - 2.5, 5, 5);
+  }
+  g.globalAlpha = 1;
+
+  const flash = Math.max(0, 1 - (now - model.fx.shrinkAt) / 400);
+  if (flash > 0) { g.fillStyle = `rgba(255, 62, 108, ${flash * 0.18})`; g.fillRect(0, 0, canvas.width, canvas.height); }
+  g.restore();
+
+  const mine = s.players[s.me];
+  if (mine) $('len').textContent = mine.len;
+  $('alive').textContent = `${s.players.filter((pl) => pl.alive).length}/${s.players.length}`;
+  const clock = game.timeMs();
+  const shrinking = clock < SHRINK_AT_MS;
+  $('timeLabel').textContent = shrinking ? 'Walls in' : 'Time';
+  $('time').textContent = Math.max(0, Math.ceil(((shrinking ? SHRINK_AT_MS : s.endsAt) - clock) / 1000));
+}
+
+let frames = 0, lastPerf = performance.now();
+function perf(now) {
+  frames++;
+  if (now - lastPerf < 1000) return;
+  $('perf').textContent = `${Math.round((frames * 1000) / (now - lastPerf))} fps · ${s.players.length}p · move ${s.moves}`;
+  frames = 0; lastPerf = now;
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

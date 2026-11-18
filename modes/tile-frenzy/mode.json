@@ -1,0 +1,15 @@
+{
+  "id": "tile-frenzy",
+  "name": "Tile Frenzy",
+  "version": "1.0.0",
+  "sdk": "0.1",
+  "author": "BlockBrawl",
+  "description": "Up to 8 players race to grab glowing tiles on a shared board. Chain grabs for combos, chase golden tiles, dodge bombs. 30 ticks a second: the stress test for tick rate and player count.",
+  "players": { "min": 1, "max": 8 },
+  "tickRate": 30,
+  "orientation": "portrait",
+  "server": "server.js",
+  "client": "client/index.html",
+  "clientModel": "client/model.js",
+  "fuzz": "tests/fuzz.js"
+}

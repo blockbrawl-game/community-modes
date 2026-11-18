@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Tile Frenzy</title>
+<style>
+  :root { --bg: #0b0d14; --panel: #12151f; --line: #232838; --text: #eef0f6; --dim: #7d8499; --gold: #ffd25a; --bomb: #ff4d6d; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: radial-gradient(120% 80% at 50% 0%, #1a1f33 0%, var(--bg) 60%); color: var(--text); font: 14px/1.4 system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 12px; user-select: none; touch-action: manipulation; overflow: hidden; }
+  .top { display: flex; justify-content: space-between; align-items: end; width: min(100%, 420px); font-variant-numeric: tabular-nums; }
+  .top b { font-size: 26px; letter-spacing: 0.5px; }
+  .top span { color: var(--dim); font-size: 12px; display: block; }
+  #combo { font-size: 26px; font-weight: 800; transition: transform 0.12s; }
+  #board { width: min(100%, 420px); aspect-ratio: 1; border-radius: 14px; background: var(--panel); box-shadow: 0 0 0 1px var(--line), 0 20px 60px rgba(0,0,0,.5); cursor: pointer; }
+  body.frenzy #board { box-shadow: 0 0 0 2px #ff5ab4, 0 0 40px rgba(255, 90, 180, .45); animation: pulse 0.6s infinite alternate; }
+  @keyframes pulse { to { box-shadow: 0 0 0 2px #ffb45a, 0 0 70px rgba(255, 180, 90, .6); } }
+  #banner { height: 20px; font-weight: 700; letter-spacing: 2px; color: #ff8ad0; }
+  .scores { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; width: min(100%, 420px); }
+  .score { background: var(--panel); border-radius: 8px; padding: 5px 8px; border-left: 4px solid; font-variant-numeric: tabular-nums; font-size: 12px; transition: transform .2s; }
+  .score b { display: block; font-size: 16px; }
+  .score.out { opacity: .4; }
+  #perf { position: fixed; right: 8px; bottom: 6px; color: var(--dim); font: 11px ui-monospace, monospace; text-align: right; }
+  .result { position: fixed; inset: 0; background: rgba(8, 9, 14, 0.88); display: none; place-items: center; text-align: center; }
+  .result.show { display: grid; }
+  .result h1 { margin: 0 0 8px; font-size: 34px; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <div><span>Score</span><b id="score">0</b></div>
+    <div style="text-align:center"><span>Combo</span><div id="combo">–</div></div>
+    <div style="text-align:right"><span>Time</span><b id="time">60</b></div>
+  </div>
+  <canvas id="board" width="840" height="840"></canvas>
+  <div id="banner"></div>
+  <div class="scores" id="scores"></div>
+  <div id="perf"></div>
+  <div class="result" id="result"><div><h1 id="resultTitle"></h1><div id="resultText"></div></div></div>
+
+<script type="module">
+import { connect } from '@blockbrawl/mode-sdk/client';
+import { createModel } from './model.js';
+import { BOMB, GOLD, SIZE } from '../shared.js';
+
+// Visual-only randomness (sparks, petals, shake). The mode checks forbid the built-in generator everywhere so that
+// game logic can never depend on it, and the effects do not need a real one.
+let fxSeed = (performance.now() * 1000) >>> 0 || 1;
+function fxRandom() {
+  fxSeed ^= fxSeed << 13; fxSeed ^= fxSeed >>> 17; fxSeed ^= fxSeed << 5;
+  return (fxSeed >>> 0) / 4294967296;
+}
+
+const COLORS = ['#4f9dff', '#ff8a4f', '#5fd08a', '#c47bff', '#ffd25a', '#ff5a8a', '#4fe0e0', '#b8e05a'];
+const TILE_HUE = { 1: '#4fc3ff', 2: '#7d7bff', 3: '#d36bff', [GOLD]: '#ffd25a', [BOMB]: '#ff4d6d' };
+
+const model = createModel();
+const s = model.state;
+const $ = (id) => document.getElementById(id);
+const canvas = $('board');
+const g = canvas.getContext('2d');
+const scoreEls = [];
+const sparks = [];
+let shake = 0;
+let lastPopCount = 0;
+
+const game = connect({
+  model,
+  onResult(result) {
+    const first = result.ranking[0];
+    const winners = Array.isArray(first) ? first : [first];
+    const solo = s.order.length === 1;
+    $('resultTitle').textContent = solo ? `${s.players[0].score} points` : winners.length > 1 ? 'Draw' : winners.includes(game.me) ? 'You win!' : 'You lose';
+    $('resultText').textContent = s.order.map((id, p) => `${name(p)}: ${s.players[p].score}`).join('   ');
+    $('result').classList.add('show');
+  },
+});
+
+function name(p) {
+  if (p === s.me) return 'You';
+  return game.players.find((pl) => pl.id === s.order[p])?.name ?? `Player ${p + 1}`;
+}
+
+function grabAt(clientX, clientY) {
+  if (!game.ready || s.over) return;
+  const me = s.players[s.me];
+  if (!me || me.out) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.floor(((clientX - rect.left) / rect.width) * SIZE);
+  const y = Math.floor(((clientY - rect.top) / rect.height) * SIZE);
+  if (x < 0 || y < 0 || x >= SIZE || y >= SIZE) return;
+  const i = y * SIZE + x;
+  if (model.shownTile(i) === 0) return; // nothing there: do not spend an action on it
+  model.predict(game.send({ t: 'grab', i }), i);
+}
+canvas.addEventListener('pointerdown', (e) => { e.preventDefault(); grabAt(e.clientX, e.clientY); });
+
+// ---- rendering --------------------------------------------------------------------------------------
+
+function roundRect(x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function burst(i, color, count) {
+  const cs = canvas.width / SIZE;
+  const cx = (i % SIZE + 0.5) * cs;
+  const cy = (Math.floor(i / SIZE) + 0.5) * cs;
+  for (let n = 0; n < count; n++) {
+    const a = fxRandom() * Math.PI * 2;
+    const v = 3 + fxRandom() * 7;
+    sparks.push({ x: cx, y: cy, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 1, color });
+  }
+}
+
+function drawBoard(now) {
+  const W = canvas.width;
+  const cs = W / SIZE;
+  const pad = cs * 0.09;
+  g.save();
+  if (shake > 0) {
+    g.translate((fxRandom() - 0.5) * shake, (fxRandom() - 0.5) * shake);
+    shake *= 0.85;
+    if (shake < 0.5) shake = 0;
+  }
+  g.clearRect(-20, -20, W + 40, W + 40);
+
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    const x = (i % SIZE) * cs + pad;
+    const y = Math.floor(i / SIZE) * cs + pad;
+    const size = cs - pad * 2;
+    const v = model.shownTile(i);
+
+    roundRect(x, y, size, size, size * 0.18);
+    g.fillStyle = '#181c2a';
+    g.fill();
+    if (v === 0) continue;
+
+    const age = Math.min(1, (now - (model.fx.litAt[i] || now)) / 180);
+    const scale = 0.55 + 0.45 * (1 - Math.pow(1 - age, 3)); // ease-out pop-in
+    const inset = (size * (1 - scale)) / 2;
+    const color = TILE_HUE[v];
+    g.shadowColor = color;
+    g.shadowBlur = v === GOLD ? 38 : 22;
+    const grad = g.createLinearGradient(x, y, x + size, y + size);
+    grad.addColorStop(0, color);
+    grad.addColorStop(1, v === BOMB ? '#7a1028' : '#1d2a5a');
+    roundRect(x + inset, y + inset, size - inset * 2, size - inset * 2, size * 0.18);
+    g.fillStyle = grad;
+    g.fill();
+    g.shadowBlur = 0;
+
+    g.fillStyle = v === BOMB ? '#fff' : '#0b0d14';
+    g.font = `800 ${size * 0.42 * scale}px system-ui, sans-serif`;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(v === BOMB ? '✹' : v === GOLD ? '★' : String(v), x + size / 2, y + size / 2 + 2);
+  }
+
+  // Sparks from grabs.
+  for (let n = sparks.length - 1; n >= 0; n--) {
+    const p = sparks[n];
+    p.x += p.vx; p.y += p.vy; p.vx *= 0.92; p.vy *= 0.92; p.life -= 0.035;
+    if (p.life <= 0) { sparks.splice(n, 1); continue; }
+    g.globalAlpha = p.life;
+    g.fillStyle = p.color;
+    g.fillRect(p.x - 3, p.y - 3, 6, 6);
+  }
+  g.globalAlpha = 1;
+
+  // Floating "+6 x3" labels.
+  for (const pop of model.fx.pops) {
+    const t = (now - pop.at) / 700;
+    if (t > 1) continue;
+    const cx = (pop.i % SIZE + 0.5) * cs;
+    const cy = (Math.floor(pop.i / SIZE) + 0.5) * cs - t * cs * 0.8;
+    g.globalAlpha = 1 - t;
+    g.fillStyle = pop.pts < 0 ? '#ff4d6d' : COLORS[pop.p % COLORS.length];
+    g.font = `800 ${cs * 0.34}px system-ui, sans-serif`;
+    g.textAlign = 'center';
+    g.fillText(`${pop.pts > 0 ? '+' : ''}${pop.pts}${pop.combo > 1 ? ` x${pop.combo}` : ''}`, cx, cy);
+  }
+  g.globalAlpha = 1;
+  g.restore();
+}
+
+function drawScores() {
+  s.players.forEach((pl, p) => {
+    let el = scoreEls[p];
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'score';
+      el.style.borderColor = COLORS[p % COLORS.length];
+      $('scores').appendChild(el);
+      scoreEls[p] = el;
+    }
+    el.classList.toggle('out', pl.out);
+    el.innerHTML = `${name(p)}<b>${pl.score}</b>`;
+  });
+}
+
+// ---- perf overlay: what this mode is for --------------------------------------------------------------
+let frames = 0, lastPerf = performance.now(), lastEvents = 0;
+function perf(now) {
+  frames++;
+  if (now - lastPerf < 1000) return;
+  const eps = model.fx.events - lastEvents;
+  $('perf').textContent = `${Math.round((frames * 1000) / (now - lastPerf))} fps · ${eps} steps/s · ${s.players.length}p`;
+  frames = 0; lastPerf = now; lastEvents = model.fx.events;
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  perf(now);
+  if (!game.ready) return;
+
+  // New grabs since the last frame: sparks, and a shake when it was a bomb or a gold tile.
+  const pops = model.fx.pops;
+  const fresh = Math.min(pops.length, model.fx.popCount - lastPopCount);
+  for (let n = pops.length - fresh; n < pops.length; n++) {
+    const pop = pops[n];
+    burst(pop.i, pop.v === BOMB ? '#ff4d6d' : pop.v === GOLD ? '#ffd25a' : COLORS[pop.p % COLORS.length], pop.v === GOLD ? 40 : 14);
+    if (pop.p === s.me && (pop.v === BOMB || pop.v === GOLD)) shake = 18;
+  }
+  lastPopCount = model.fx.popCount;
+
+  const me = s.players[s.me];
+  if (me) {
+    $('score').textContent = me.score;
+    $('combo').textContent = me.combo > 1 ? `x${me.combo}` : '–';
+    $('combo').style.color = ['#7d8499', '#7d8499', '#4fc3ff', '#7d7bff', '#d36bff', '#ffd25a'][me.combo] || '#7d8499';
+  }
+  const left = Math.max(0, Math.ceil((s.endsAt - game.timeMs()) / 1000));
+  $('time').textContent = left;
+  document.body.classList.toggle('frenzy', s.frenzy && !s.over);
+  $('banner').textContent = s.frenzy && !s.over ? 'FRENZY' : '';
+  drawBoard(now);
+  drawScores();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
